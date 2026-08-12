@@ -102,7 +102,17 @@ async function search(customText = null) {
     if (!res.ok || !data.ok) {
       addAssistant(`Bir sorun oluştu: <strong>${escapeHtml(data.error || "Bilinmeyen hata")}</strong>`);
     } else {
-      vehicleState = data.state || vehicleState;
+      if (data.state && typeof data.state === "object") {
+        vehicleState = {
+          ...vehicleState,
+          ...Object.fromEntries(
+            Object.entries(data.state).filter(([key, value]) => {
+              if (key === "candidate_keys") return Array.isArray(value);
+              return value !== null && value !== undefined && value !== "";
+            })
+          )
+        };
+      }
       addAssistant(renderResult(data));
     }
   } catch (err) {
