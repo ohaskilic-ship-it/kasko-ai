@@ -167,14 +167,14 @@ def local_extract_turn(message, state):
         return result
 
     # Model yılı.
-    ym = re.search(r"\\b(19\\d{2}|20\\d{2})\\b", norm)
+    ym = re.search(r"\b(19\d{2}|20\d{2})\b", norm)
     if ym:
         result["year"] = int(ym.group(1))
 
     # Açık marka adı.
     brand_hits = []
     for bnorm in brands:
-        if re.search(rf"\\b{re.escape(bnorm)}\\b", norm):
+        if re.search(rf"\b{re.escape(bnorm)}\b", norm):
             brand_hits.append(bnorm)
     if brand_hits:
         # En uzun marka adını seç (örn. LAND ROVER).
@@ -526,7 +526,7 @@ def refine_locally(rows, user_message):
         text = normalize(r["Tip Adı"])
         score = 0
         for term in terms:
-            if re.search(rf"\\b{re.escape(term)}\\b", text):
+            if re.search(rf"\b{re.escape(term)}\b", text):
                 score += 3
             elif term in text:
                 score += 2
@@ -694,13 +694,40 @@ def professional_not_found_message():
     )
 
 
+
+def deterministic_missing_question(state):
+    """Known facts are never re-asked. No Gemini call is needed for basic slot filling."""
+    year = state.get("year")
+    brand = state.get("brand")
+    model = state.get("model_or_type")
+
+    if year and brand and not model:
+        return f"Anladım, aracınız {year} model {brand}. Peki modeli nedir?"
+    if year and model and not brand:
+        return f"Anladım, aracınız {year} model {model}. Markasını da söyler misiniz?"
+    if brand and model and not year:
+        return f"Anladım, aracınız {brand} {model}. Model yılı nedir?"
+    if year and not brand and not model:
+        return f"Anladım, aracınız {year} model. Markası veya modeli nedir?"
+    if brand and not year and not model:
+        return f"Anladım, aracınız {brand}. Modeli ve model yılı nedir?"
+    if model and not year:
+        return f"{model} modelini anladım. Model yılı nedir?"
+    return "Aracınızın model yılı ile marka/modelini yazar mısınız?"
+
 def process_search(message, incoming_state):
+    incoming_state = incoming_state if isinstance(incoming_state, dict) else {}
     state = {
         "year": incoming_state.get("year"),
         "brand": incoming_state.get("brand"),
         "model_or_type": incoming_state.get("model_or_type"),
         "candidate_keys": incoming_state.get("candidate_keys") or [],
     }
+    if state["year"] not in (None, ""):
+        try:
+            state["year"] = int(state["year"])
+        except (TypeError, ValueError):
+            state["year"] = None
 
     turn = extract_turn_smart(message, state)
 
@@ -731,37 +758,17 @@ def process_search(message, incoming_state):
     # Model verilmişse, marka söylenmemiş olsa bile tüm listeden markayı çıkarmaya çalış.
     state, global_rows, global_score = infer_brand_from_model(state, turn, message)
 
-    # Kullanıcı yalnızca yılı söylediyse "bulunamadı" deme; sohbeti devam ettir.
+    # Temel bilgi toplama tamamen deterministiktir; bilinen bilgi tekrar sorulmaz.
     if state.get("year") and not state.get("brand") and not state.get("model_or_type"):
-        reply = natural_conversation_reply(
-            f"Aracın model yılı: {state['year']}. Marka ve model henüz bilinmiyor.",
-            f"{state['year']} model bilgisini anladığını belirt ve aracın marka veya modelini sor.",
-            fallback=f"Anladım, aracınız {state['year']} model. Peki markası veya modeli nedir?"
-        )
-        return {"status": "need_info", "question": reply["reply"], "options": [], "state": state}
+        return {"status": "need_info", "question": deterministic_missing_question(state), "options": [], "state": state}
 
-    # Modeli anladık ama yıl yoksa marka çıkarımını da kullanarak yılı iste.
+    # Model/marka biliniyor fakat yıl eksikse yalnızca yılı sor.
     if not state.get("year"):
-        known = []
-        if state.get("brand"):
-            known.append(f"marka: {state['brand']}")
-        if state.get("model_or_type"):
-            known.append(f"model/tip: {state['model_or_type']}")
-        reply = natural_conversation_reply(
-            ", ".join(known) if known else "Model yılı henüz bilinmiyor.",
-            "Bilinen araç bilgisini doğal biçimde teyit et ve yalnızca model yılını sor.",
-            fallback="Aracı anladım. Model yılını da söyler misiniz?"
-        )
-        return {"status": "need_info", "question": reply["reply"], "options": [], "state": state}
+        return {"status": "need_info", "question": deterministic_missing_question(state), "options": [], "state": state}
 
-    # Marka var ama model/tip yok.
+    # Yıl ve marka biliniyor fakat model eksikse yalnızca modeli sor.
     if state.get("brand") and not state.get("model_or_type"):
-        reply = natural_conversation_reply(
-            f"Model yılı: {state['year']}; marka: {state['brand']}; model/tip bilinmiyor.",
-            "Bilinen yıl ve markayı teyit et, yalnızca model/tip bilgisini sor.",
-            fallback=f"Anladım, {state['year']} model {state['brand']}. Peki aracın modeli nedir?"
-        )
-        return {"status": "need_info", "question": reply["reply"], "options": [], "state": state}
+        return {"status": "need_info", "question": deterministic_missing_question(state), "options": [], "state": state}
 
     requested_year = int(state["year"])
     oldest_year = get_oldest_list_year()
