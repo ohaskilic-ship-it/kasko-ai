@@ -112,20 +112,147 @@ def get_ai_client():
 def ai_json(prompt, schema, max_tokens=700):
     client = get_ai_client()
     if client is None:
-        raise RuntimeError("Gemini API anahtarı henüz tanımlanmamış.")
+        raise RuntimeError("AI_UNAVAILABLE")
 
-    response = client.models.generate_content(
-        model=MODEL,
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-            response_schema=schema,
-            max_output_tokens=max_tokens,
-            temperature=0.1,
-        ),
-    )
-    return schema.model_validate_json(response.text).model_dump()
+    try:
+        response = client.models.generate_content(
+            model=MODEL,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema=schema,
+                max_output_tokens=max_tokens,
+                temperature=0.1,
+            ),
+        )
+        return schema.model_validate_json(response.text).model_dump()
+    except Exception as exc:
+        text = str(exc).upper()
+        if "429" in text or "RESOURCE_EXHAUSTED" in text or "QUOTA" in text:
+            raise RuntimeError("AI_QUOTA") from exc
+        raise RuntimeError("AI_UNAVAILABLE") from exc
 
+
+
+COMMON_WORDS = {
+    "MODEL", "MODELI", "ARAC", "ARACI", "ARACIM", "ARACIMIZ", "KASKO",
+    "DEGER", "DEGERI", "NEDIR", "BUL", "BAK", "MERHABA", "SELAM",
+    "BENIM", "BIZIM", "BIR", "VE", "ILE", "ICIN", "TL", "MARKA",
+    "MARKASI", "TIP", "TIPI", "SERISI", "SERI", "DEGIL", "DEĞIL",
+    "EVET", "HAYIR", "PEKI", "TAMAM"
+}
+
+
+def local_extract_turn(message, state):
+    """
+    Basit ve yaygın mesajları Gemini'ye gitmeden çözer.
+    Böylece '2021 passat', '2004 model', 'egea' gibi sorgular ücretsiz,
+    hızlı ve kota tüketmeden işlenir.
+    """
+    raw = str(message or "").strip()
+    norm = normalize(raw)
+    result = {
+        "year": None,
+        "brand": None,
+        "model_or_type": None,
+        "descriptors": [],
+        "is_greeting_only": False,
+    }
+
+    # Sadece selamlaşma mı?
+    greeting_tokens = {"MERHABA", "SELAM", "SELAMLAR", "HEY", "SA"}
+    toks = norm.split()
+    if toks and all(t in greeting_tokens for t in toks):
+        result["is_greeting_only"] = True
+        return result
+
+    # Model yılı.
+    ym = re.search(r"\\b(19\\d{2}|20\\d{2})\\b", norm)
+    if ym:
+        result["year"] = int(ym.group(1))
+
+    # Açık marka adı.
+    brand_hits = []
+    for bnorm in brands:
+        if re.search(rf"\\b{re.escape(bnorm)}\\b", norm):
+            brand_hits.append(bnorm)
+    if brand_hits:
+        # En uzun marka adını seç (örn. LAND ROVER).
+        chosen = max(brand_hits, key=len)
+        original = df.loc[df["_brand_norm"] == chosen, "Marka Adı"].iloc[0]
+        result["brand"] = str(original)
+
+    # Marka/yıl/genel kelimeleri atıp model olabilecek metni çıkar.
+    cleaned_tokens = []
+    brand_norm_tokens = set(normalize(result["brand"]).split()) if result["brand"] else set()
+    for t in toks:
+        if t == str(result["year"] or ""):
+            continue
+        if t in COMMON_WORDS or t in brand_norm_tokens:
+            continue
+        cleaned_tokens.append(t)
+
+    candidate_text = " ".join(cleaned_tokens).strip()
+
+    # Önce kalan ifadenin tamamını, sonra kelimeleri global tip listesinde ara.
+    if candidate_text:
+        rows, score = global_model_candidates(candidate_text, raw, limit=120)
+        if not rows.empty and score >= 72:
+            # Kullanıcının yazdığı ifadeyi state'e koymak yerine gerçek kayıtlarda
+            # ortak olan en anlamlı model ipucunu kullan.
+            hint = common_model_hint(rows)
+            result["model_or_type"] = hint or candidate_text.title()
+
+            if not result["brand"]:
+                ub = rows["Marka Adı"].drop_duplicates().tolist()
+                if len(ub) == 1:
+                    result["brand"] = str(ub[0])
+        else:
+            # Tek kelimelik model adları için ayrı deneme.
+            best = None
+            for token in cleaned_tokens:
+                if len(token) < 3:
+                    continue
+                r, s = global_model_candidates(token, raw, limit=120)
+                if not r.empty and (best is None or s > best[2]):
+                    best = (token, r, s)
+            if best and best[2] >= 78:
+                token, rows, score = best
+                result["model_or_type"] = token.title()
+                if not result["brand"]:
+                    ub = rows["Marka Adı"].drop_duplicates().tolist()
+                    if len(ub) == 1:
+                        result["brand"] = str(ub[0])
+
+    # Model bulunamadıysa kalan ifadeleri ayırt edici bilgi olarak sakla.
+    if cleaned_tokens and not result["model_or_type"]:
+        result["descriptors"] = cleaned_tokens
+
+    return result
+
+
+def extract_turn_smart(message, state):
+    local = local_extract_turn(message, state)
+
+    # Yerel çözümleyici yeterli bilgi yakaladıysa Gemini'yi hiç çağırma.
+    if local["is_greeting_only"] or local["year"] or local["brand"] or local["model_or_type"]:
+        return local
+
+    # Devam eden adaylarda kısa cevaplar (sedan, otomatik, business vb.)
+    # doğrudan descriptor olarak kullanılabilir.
+    if state.get("candidate_keys"):
+        norm = normalize(message)
+        if norm:
+            local["descriptors"] = norm.split()
+            return local
+
+    # Sadece gerçekten belirsiz cümlelerde Gemini'den yardım iste.
+    try:
+        return extract_turn(message, state)
+    except Exception:
+        norm = normalize(message)
+        local["descriptors"] = [t for t in norm.split() if t not in COMMON_WORDS]
+        return local
 
 def extract_turn(message, state):
     state_text = (
@@ -365,6 +492,58 @@ def candidate_lines(rows, year, max_rows=35):
     return "\n".join(items)
 
 
+
+def refine_locally(rows, user_message):
+    """Kısa kullanıcı cevaplarıyla adayları Gemini kullanmadan daralt."""
+    if len(rows) <= 1:
+        return rows
+
+    q = normalize(user_message)
+    if not q:
+        return rows
+
+    synonyms = {
+        "OTOMATIK": ["DSG", "EDC", "DCT", "AT", "TIPTRONIC", "CVT", "AUTO", "AUTOMATIC"],
+        "DIZEL": ["TDI", "CDI", "DCI", "HDI", "CRDI", "DIZEL"],
+        "BENZINLI": ["TSI", "TFSI", "TCE", "BENZIN"],
+        "SEDAN": ["SEDAN"],
+        "VARIANT": ["VARIANT", "STATION", "SW"],
+        "STATION": ["VARIANT", "STATION", "SW"],
+    }
+
+    terms = []
+    for token in q.split():
+        if token in synonyms:
+            terms.extend(synonyms[token])
+        elif len(token) >= 2 and token not in COMMON_WORDS:
+            terms.append(token)
+
+    if not terms:
+        return rows
+
+    scores = []
+    for idx, r in rows.iterrows():
+        text = normalize(r["Tip Adı"])
+        score = 0
+        for term in terms:
+            if re.search(rf"\\b{re.escape(term)}\\b", text):
+                score += 3
+            elif term in text:
+                score += 2
+            else:
+                score += fuzz.partial_ratio(term, text) / 100.0
+        scores.append((idx, score))
+
+    if not scores:
+        return rows
+    best = max(s for _, s in scores)
+    if best < 1.5:
+        return rows
+
+    keep = [idx for idx, s in scores if s >= max(1.5, best - 0.8)]
+    narrowed = rows.loc[keep].copy()
+    return narrowed if not narrowed.empty else rows
+
 def refine_with_ai(rows, year, user_message):
     if len(rows) <= 1:
         return rows
@@ -441,7 +620,7 @@ Amaç:
     except Exception:
         model = common_model_hint(rows)
         return {
-            "question": f"{model or 'Araç'} için birden fazla kayıt buldum. Motor, yakıt ve donanım paketini biraz daha belirtir misiniz?",
+            "question": f"{model or 'Aracınız'} için birden fazla uygun kayıt buldum. Motor hacmi, yakıt türü, şanzıman veya donanım paketinden bildiğiniz birini söyler misiniz?",
             "options": []
         }
 
@@ -523,7 +702,7 @@ def process_search(message, incoming_state):
         "candidate_keys": incoming_state.get("candidate_keys") or [],
     }
 
-    turn = extract_turn(message, state)
+    turn = extract_turn_smart(message, state)
 
     if turn.get("is_greeting_only") and not any(
         [state.get("year"), state.get("brand"), state.get("model_or_type"), state["candidate_keys"]]
@@ -597,27 +776,20 @@ def process_search(message, incoming_state):
 
     search_year = oldest_year if requested_year < oldest_year else requested_year
 
-    # Model/tip global olarak güçlü biçimde tanındıysa, hedef baz yılda gerçekten
-    # aynı aracın bir değeri var mı kontrol et. Bu, örn. '2004 Egea' gibi
-    # model-yıl çelişkilerini doğal biçimde yakalar.
-    if not global_rows.empty and global_score >= 70:
-        year_compatible = global_rows[global_rows[str(search_year)] > 0].copy()
-        if year_compatible.empty:
-            inferred_brand = state.get("brand") or "markası"
-            reply = natural_conversation_reply(
-                f"Kullanıcının söylediği model/tip: {state.get('model_or_type')}. "
-                f"Bu model/tip listede {inferred_brand} markasıyla eşleşiyor. "
-                f"Kullanıcının söylediği model yılı: {requested_year}. "
-                f"Ancak bu araç tipi {search_year} baz yılında değer taşımıyor; yıl ile araç tipi birbiriyle uyumlu görünmüyor.",
-                "Model/tipi tanıdığını ve mümkünse markasını anladığını söyle. Model yılı ile araç bilgisinin uyumlu görünmediğini nazikçe belirt ve model yılını kontrol etmesini sor.",
-                fallback=f"{state.get('model_or_type')} modelini {inferred_brand} olarak anladım; ancak {requested_year} model yılı bu araçla uyumlu görünmüyor. Model yılını kontrol eder misiniz?"
-            )
-            return {"status": "need_info", "question": reply["reply"], "options": [], "state": state}
+    # Model-yıl uyumluluğu burada peşinen reddedilmez.
+    # Önce gerçek CSV adayları aranır. Böylece 2021 Passat gibi geçerli
+    # araçların yanlışlıkla "uyumsuz" sayılması engellenir.
 
     # Devam eden adayları son kullanıcı cevabıyla daralt.
     if state["candidate_keys"]:
         candidates = rows_from_keys(state["candidate_keys"], search_year)
-        candidates = refine_with_ai(candidates, search_year, message)
+        before_count = len(candidates)
+        candidates = refine_locally(candidates, message)
+        if len(candidates) == before_count and before_count > 8:
+            try:
+                candidates = refine_with_ai(candidates, search_year, message)
+            except Exception:
+                pass
     else:
         candidates = token_search_initial(
             search_year,
@@ -633,11 +805,7 @@ def process_search(message, incoming_state):
             candidates = global_rows[global_rows[str(search_year)] > 0].copy().head(80)
 
         if len(candidates) > 1 and turn.get("descriptors"):
-            candidates = refine_with_ai(
-                candidates,
-                search_year,
-                " ".join(turn["descriptors"])
-            )
+            candidates = refine_locally(candidates, " ".join(turn["descriptors"]))
 
     candidates = candidates[candidates[str(search_year)] > 0].copy()
 
@@ -706,10 +874,23 @@ def search():
         result = process_search(message, state)
         return jsonify({"ok": True, **result})
     except Exception as exc:
+        # API anahtarı, kota, Python exception vb. teknik ayrıntıları kullanıcıya gösterme.
+        text = str(exc).upper()
+        if "AI_QUOTA" in text or "429" in text or "RESOURCE_EXHAUSTED" in text:
+            return jsonify({
+                "ok": True,
+                "status": "need_info",
+                "question": "Şu anda yapay zekâ hizmeti kısa süreli yoğunluk yaşıyor. Araç bilgilerinizi biraz daha ayrıntılı yazarak tekrar deneyebilirsiniz.",
+                "options": [],
+                "state": state
+            })
         return jsonify({
-            "ok": False,
-            "error": f"İşlem sırasında hata oluştu: {exc}"
-        }), 500
+            "ok": True,
+            "status": "need_info",
+            "question": "Aracı tam eşleştiremedim. Marka, model, model yılı, motor veya donanım bilgilerinden bildiklerinizi biraz daha ayrıntılı yazar mısınız?",
+            "options": [],
+            "state": state
+        })
 
 
 if __name__ == "__main__":
