@@ -5,7 +5,7 @@ import unicodedata
 from pathlib import Path
 
 import pandas as pd
-from flask import Flask, jsonify, render_template, request
+from flask import Flask, jsonify, render_template, request, Response
 from rapidfuzz import fuzz, process
 from google import genai
 from google.genai import types
@@ -16,7 +16,7 @@ app = Flask(__name__)
 DATA_DIR = Path(__file__).parent / "data"
 CSV_PATTERN = str(DATA_DIR / "kasko_guncel*.csv")
 MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
-APP_VERSION = "2.6-exact-selection"
+APP_VERSION = "2.7-seo"
 
 df = None
 brands = []
@@ -1512,6 +1512,30 @@ def process_search(message, incoming_state):
         "candidate_count": int(len(candidates)),
         "state": state
     }
+
+
+@app.route("/robots.txt")
+def robots_txt():
+    content = """User-agent: *
+Allow: /
+Sitemap: https://kasko-ai.vercel.app/sitemap.xml
+"""
+    return Response(content, mimetype="text/plain")
+
+
+@app.route("/sitemap.xml")
+def sitemap_xml():
+    content = """<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <url>
+    <loc>https://kasko-ai.vercel.app/</loc>
+    <changefreq>monthly</changefreq>
+    <priority>1.0</priority>
+  </url>
+</urlset>
+"""
+    return Response(content, mimetype="application/xml")
+
 
 @app.route("/")
 def index():
