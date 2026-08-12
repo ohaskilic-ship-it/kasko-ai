@@ -16,7 +16,7 @@ app = Flask(__name__)
 DATA_DIR = Path(__file__).parent / "data"
 CSV_PATTERN = str(DATA_DIR / "kasko_guncel*.csv")
 MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
-APP_VERSION = "2.3-brand-code-lock"
+APP_VERSION = "2.5-smart-disambiguation"
 
 df = None
 brands = []
@@ -711,6 +711,35 @@ def infer_engine_label(type_name):
     return match.group(1) if match else None
 
 
+def infer_power_label(type_name):
+    """
+    Tip adından motor gücünü ayırt etmeye çalışır.
+    Örn: DCI 85, DCI (105), 110 EDC, 115 CVT -> 85 / 105 / 110 / 115 HP
+    """
+    text = normalize(type_name)
+
+    # Parantez içindeki tipik güç değerleri
+    matches = re.findall(r"\((\d{2,3})\)", text)
+    for value in matches:
+        n = int(value)
+        if 60 <= n <= 700:
+            return f"{n} HP"
+
+    # Motor ifadesinden sonra gelen tipik güç değerleri
+    patterns = [
+        r"\b(?:DCI|TDI|CDI|HDI|TSI|TFSI|TCE|MPI|16V)\s+(\d{2,3})\b",
+        r"\b(\d{2,3})\s+(?:EDC|DSG|CVT|OV|E5|E6)\b",
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, text)
+        if m:
+            n = int(m.group(1))
+            if 60 <= n <= 700:
+                return f"{n} HP"
+
+    return None
+
+
 def family_rows_from_state(state):
     keys = state.get("family_keys") or []
     if not keys:
@@ -839,10 +868,12 @@ def candidate_package_options(rows, state):
 
 def make_safe_question(rows, year, state):
     """
-    Gemini'ye araç adı/paket uydurtmadan, yalnızca gerçek adaylardan soru üretir.
+    Yalnızca gerçek kalan adaylara göre soru üretir.
+    Aday sayısı çok azaldığında soyut soru sormak yerine gerçek tipleri seçtirir.
     """
     rows = enforce_brand_code_lock(rows, state)
     rows = enforce_family_lock(rows, state)
+
     if rows.empty:
         return {
             "question": "Aracı bu bilgilerle netleştiremedim. Motor, yakıt, şanzıman veya donanım bilgisinden bildiğiniz birini söyler misiniz?",
@@ -859,11 +890,28 @@ def make_safe_question(rows, year, state):
     prefix = " ".join(known).strip()
     prefix = f"{prefix} için" if prefix else "Aracınız için"
 
+    # En önemli UX düzeltmesi:
+    # Sadece 2-3 gerçek kayıt kaldıysa kullanıcıya artık aynı genel soruyu
+    # tekrar tekrar sormak yerine kalan kayıtların kendisini seçtir.
+    if 2 <= len(rows) <= 3:
+        options = []
+        for name in rows["Tip Adı"].drop_duplicates().tolist():
+            if name not in options:
+                options.append(str(name))
+
+        return {
+            "question": (
+                f"{prefix} {len(options)} olası kayıt kaldı. "
+                "Aşağıdaki seçeneklerden aracınıza ait olanı seçer misiniz?"
+            ),
+            "options": options[:3]
+        }
+
     # 1) Yakıt
     fuels = []
-    for x in rows["Tip Adı"].map(infer_fuel_label).tolist():
-        if x not in fuels:
-            fuels.append(x)
+    for value in rows["Tip Adı"].map(infer_fuel_label).tolist():
+        if value not in fuels:
+            fuels.append(value)
     if 1 < len(fuels) <= 4:
         return {
             "question": f"Anladım. {prefix} birkaç seçenek kaldı. Yakıt türü nedir?",
@@ -872,9 +920,9 @@ def make_safe_question(rows, year, state):
 
     # 2) Kasa
     bodies = []
-    for x in rows["Tip Adı"].map(infer_body_label).tolist():
-        if x and x not in bodies:
-            bodies.append(x)
+    for value in rows["Tip Adı"].map(infer_body_label).tolist():
+        if value and value not in bodies:
+            bodies.append(value)
     if 1 < len(bodies) <= 5:
         return {
             "question": f"{prefix} kasa tipini de netleştirelim. Hangisi aracınıza uyuyor?",
@@ -883,27 +931,38 @@ def make_safe_question(rows, year, state):
 
     # 3) Motor hacmi
     engines = []
-    for x in rows["Tip Adı"].map(infer_engine_label).tolist():
-        if x and x not in engines:
-            engines.append(x)
+    for value in rows["Tip Adı"].map(infer_engine_label).tolist():
+        if value and value not in engines:
+            engines.append(value)
     if 1 < len(engines) <= 6:
         return {
             "question": f"{prefix} motor hacmi nedir?",
             "options": engines
         }
 
-    # 4) Şanzıman
+    # 4) Motor gücü
+    powers = []
+    for value in rows["Tip Adı"].map(infer_power_label).tolist():
+        if value and value not in powers:
+            powers.append(value)
+    if 1 < len(powers) <= 6:
+        return {
+            "question": f"{prefix} motor gücü hangisi?",
+            "options": powers
+        }
+
+    # 5) Şanzıman
     transmissions = []
-    for x in rows["Tip Adı"].map(infer_transmission_label).tolist():
-        if x not in transmissions:
-            transmissions.append(x)
+    for value in rows["Tip Adı"].map(infer_transmission_label).tolist():
+        if value not in transmissions:
+            transmissions.append(value)
     if 1 < len(transmissions) <= 3:
         return {
             "question": f"{prefix} şanzıman tipi nedir?",
             "options": transmissions
         }
 
-    # 5) Donanım / paket
+    # 6) Donanım / paket
     packages = candidate_package_options(rows, state)
     if 1 < len(packages) <= 8:
         return {
@@ -911,8 +970,23 @@ def make_safe_question(rows, year, state):
             "options": packages[:5]
         }
 
+    # 4-5 aday kaldıysa da gerçek tip adlarını seçenek olarak göstermek,
+    # aynı soruyu tekrar etmekten daha kullanışlıdır.
+    if 2 <= len(rows) <= 5:
+        options = []
+        for name in rows["Tip Adı"].drop_duplicates().tolist():
+            if name not in options:
+                options.append(str(name))
+        return {
+            "question": f"{prefix} birkaç kayıt kaldı. Aracınıza ait olan seçeneği seçer misiniz?",
+            "options": options[:5]
+        }
+
     return {
-        "question": f"{prefix} birden fazla kayıt kaldı. Motor gücü, şanzıman veya donanım paketinden bildiğiniz bir ayrıntıyı yazar mısınız?",
+        "question": (
+            f"{prefix} birden fazla kayıt kaldı. "
+            "Motor gücü, şanzıman veya donanım paketinden bildiğiniz bir ayrıntıyı yazar mısınız?"
+        ),
         "options": []
     }
 
@@ -965,6 +1039,14 @@ def refine_locally(rows, user_message):
     if engine:
         wanted = engine.group(1)
         hit = rows[rows["Tip Adı"].map(infer_engine_label) == wanted].copy()
+        if not hit.empty:
+            return hit
+
+    # Motor gücü / beygir
+    power_match = re.search(r"\b(\d{2,3})\s*(?:HP|BG|BEYGIR)?\b", q)
+    if power_match:
+        wanted_power = f"{int(power_match.group(1))} HP"
+        hit = rows[rows["Tip Adı"].map(infer_power_label) == wanted_power].copy()
         if not hit.empty:
             return hit
 
