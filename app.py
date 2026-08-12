@@ -16,6 +16,7 @@ app = Flask(__name__)
 DATA_DIR = Path(__file__).parent / "data"
 CSV_PATTERN = str(DATA_DIR / "kasko_guncel*.csv")
 MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
+APP_VERSION = "2.3-brand-code-lock"
 
 df = None
 brands = []
@@ -35,6 +36,10 @@ def normalize(value):
     s = re.sub(r"[^A-Z0-9]+", " ", s)
     return re.sub(r"\s+", " ", s).strip()
 
+
+def compact_normalize(value):
+    """E200, E 200 ve E-200 gibi yazımları aynı anahtara dönüştürür."""
+    return normalize(value).replace(" ", "")
 
 def load_csv():
     global df, brands, year_columns
@@ -60,6 +65,8 @@ def load_csv():
     data["_brand_norm"] = data["Marka Adı"].map(normalize)
     data["_type_norm"] = data["Tip Adı"].map(normalize)
     data["_full_norm"] = (data["Marka Adı"] + " " + data["Tip Adı"]).map(normalize)
+    data["_type_compact"] = data["Tip Adı"].map(compact_normalize)
+    data["_full_compact"] = (data["Marka Adı"] + " " + data["Tip Adı"]).map(compact_normalize)
     data["_row_key"] = data["Marka Kodu"].astype(str) + ":" + data["Tip Kodu"].astype(str)
 
     year_columns = [c for c in data.columns if re.fullmatch(r"\d{4}", str(c))]
@@ -145,9 +152,8 @@ COMMON_WORDS = {
 
 def local_extract_turn(message, state):
     """
-    Basit ve yaygın mesajları Gemini'ye gitmeden çözer.
-    Böylece '2021 passat', '2004 model', 'egea' gibi sorgular ücretsiz,
-    hızlı ve kota tüketmeden işlenir.
+    Yaygın mesajları Gemini'ye gitmeden çözer.
+    Marka biliniyorsa model araması yalnızca o markanın Marka Kodu havuzunda yapılır.
     """
     raw = str(message or "").strip()
     norm = normalize(raw)
@@ -159,98 +165,155 @@ def local_extract_turn(message, state):
         "is_greeting_only": False,
     }
 
-    # Sadece selamlaşma mı?
     greeting_tokens = {"MERHABA", "SELAM", "SELAMLAR", "HEY", "SA"}
     toks = norm.split()
     if toks and all(t in greeting_tokens for t in toks):
         result["is_greeting_only"] = True
         return result
 
-    # Model yılı.
     ym = re.search(r"\b(19\d{2}|20\d{2})\b", norm)
     if ym:
         result["year"] = int(ym.group(1))
 
-    # Açık marka adı.
-    brand_hits = []
-    for bnorm in brands:
-        if re.search(rf"\b{re.escape(bnorm)}\b", norm):
-            brand_hits.append(bnorm)
-    if brand_hits:
-        # En uzun marka adını seç (örn. LAND ROVER).
-        chosen = max(brand_hits, key=len)
-        original = df.loc[df["_brand_norm"] == chosen, "Marka Adı"].iloc[0]
-        result["brand"] = str(original)
+    detected_brand = detect_brand_locally(norm)
+    if detected_brand:
+        result["brand"] = detected_brand
 
-    # Marka/yıl/genel kelimeleri atıp model olabilecek metni çıkar.
+    scope_state = dict(state or {})
+    if result["brand"]:
+        scope_state["brand"] = result["brand"]
+        scope_state = establish_brand_code_lock(scope_state)
+
+    allowed_codes = scope_state.get("brand_codes") or []
+
+    brand_tokens = set()
+    if result["brand"]:
+        brand_tokens.update(normalize(result["brand"]).split())
+    elif state.get("brand"):
+        brand_tokens.update(normalize(state["brand"]).split())
+
     cleaned_tokens = []
-    brand_norm_tokens = set(normalize(result["brand"]).split()) if result["brand"] else set()
-    for t in toks:
-        if t == str(result["year"] or ""):
+    for token in toks:
+        if token == str(result["year"] or ""):
             continue
-        if t in COMMON_WORDS or t in brand_norm_tokens:
+        if token in COMMON_WORDS or token in brand_tokens:
             continue
-        cleaned_tokens.append(t)
+        cleaned_tokens.append(token)
 
     candidate_text = " ".join(cleaned_tokens).strip()
 
-    # Önce kalan ifadenin tamamını, sonra kelimeleri global tip listesinde ara.
     if candidate_text:
-        rows, score = global_model_candidates(candidate_text, raw, limit=120)
+        rows, score = global_model_candidates(
+            candidate_text,
+            raw,
+            limit=160,
+            allowed_brand_codes=allowed_codes
+        )
+
         if not rows.empty and score >= 72:
-            # Kullanıcının yazdığı ifadeyi state'e koymak yerine gerçek kayıtlarda
-            # ortak olan en anlamlı model ipucunu kullan.
-            hint = common_model_hint(rows)
-            result["model_or_type"] = hint or candidate_text.title()
+            compact_candidate = compact_normalize(candidate_text)
+
+            if (
+                re.search(r"[A-Z]", compact_candidate)
+                and re.search(r"\d", compact_candidate)
+                and len(compact_candidate) <= 12
+            ):
+                result["model_or_type"] = candidate_text.upper()
+            else:
+                hint = common_model_hint(rows)
+                result["model_or_type"] = hint or candidate_text.title()
 
             if not result["brand"]:
-                ub = rows["Marka Adı"].drop_duplicates().tolist()
-                if len(ub) == 1:
-                    result["brand"] = str(ub[0])
+                unique_brands = rows["Marka Adı"].drop_duplicates().tolist()
+                if len(unique_brands) == 1:
+                    result["brand"] = str(unique_brands[0])
+
         else:
-            # Tek kelimelik model adları için ayrı deneme.
             best = None
             for token in cleaned_tokens:
-                if len(token) < 3:
+                if len(token) < 2:
                     continue
-                r, s = global_model_candidates(token, raw, limit=120)
-                if not r.empty and (best is None or s > best[2]):
-                    best = (token, r, s)
-            if best and best[2] >= 78:
-                token, rows, score = best
-                result["model_or_type"] = token.title()
-                if not result["brand"]:
-                    ub = rows["Marka Adı"].drop_duplicates().tolist()
-                    if len(ub) == 1:
-                        result["brand"] = str(ub[0])
 
-    # Model bulunamadıysa kalan ifadeleri ayırt edici bilgi olarak sakla.
+                rows2, score2 = global_model_candidates(
+                    token,
+                    raw,
+                    limit=160,
+                    allowed_brand_codes=allowed_codes
+                )
+
+                if not rows2.empty and (best is None or score2 > best[2]):
+                    best = (token, rows2, score2)
+
+            if best and best[2] >= 78:
+                token, rows2, score2 = best
+                result["model_or_type"] = (
+                    token.upper() if any(c.isdigit() for c in token) else token.title()
+                )
+
+                if not result["brand"]:
+                    unique_brands = rows2["Marka Adı"].drop_duplicates().tolist()
+                    if len(unique_brands) == 1:
+                        result["brand"] = str(unique_brands[0])
+
     if cleaned_tokens and not result["model_or_type"]:
         result["descriptors"] = cleaned_tokens
 
     return result
 
-
 def extract_turn_smart(message, state):
+    raw = str(message or "").strip()
+    norm = normalize(raw)
+
+    # Bir araç ailesi kilitlendiyse; yakıt, paket, şanzıman gibi kısa cevapları
+    # yeni bir model sanma. Araç ancak kullanıcı açıkça düzeltme yaparsa değişir.
+    if state.get("family_keys") or state.get("candidate_keys"):
+        correction_words = {
+            "HAYIR", "DEGIL", "DEĞIL", "ASLINDA", "YANLIS", "YANLIŞ",
+            "DUZELTEYIM", "DÜZELTEYIM", "MODELIM", "MODELİM"
+        }
+        has_correction = any(w in norm.split() for w in correction_words)
+
+        # Yıl düzeltmesi her zaman kabul edilir.
+        ym = re.search(r"\b(19\d{2}|20\d{2})\b", norm)
+        if ym and len(norm.split()) <= 4 and not has_correction:
+            return {
+                "year": int(ym.group(1)),
+                "brand": None,
+                "model_or_type": None,
+                "descriptors": [],
+                "is_greeting_only": False,
+            }
+
+        # Açık bir marka veya "hayır/değil/aslında" gibi düzeltme varsa
+        # normal çözümleyici yeni aracı anlamaya çalışabilir.
+        explicit_brand = False
+        for bnorm in brands:
+            if re.search(rf"\b{re.escape(bnorm)}\b", norm):
+                explicit_brand = True
+                break
+
+        if not has_correction and not explicit_brand:
+            return {
+                "year": None,
+                "brand": None,
+                "model_or_type": None,
+                "descriptors": [t for t in norm.split() if t not in COMMON_WORDS],
+                "is_greeting_only": False,
+            }
+
     local = local_extract_turn(message, state)
 
-    # Yerel çözümleyici yeterli bilgi yakaladıysa Gemini'yi hiç çağırma.
     if local["is_greeting_only"] or local["year"] or local["brand"] or local["model_or_type"]:
         return local
 
-    # Devam eden adaylarda kısa cevaplar (sedan, otomatik, business vb.)
-    # doğrudan descriptor olarak kullanılabilir.
     if state.get("candidate_keys"):
-        norm = normalize(message)
         if norm:
-            local["descriptors"] = norm.split()
+            local["descriptors"] = [t for t in norm.split() if t not in COMMON_WORDS]
             return local
 
-    # Sadece gerçekten belirsiz cümlelerde Gemini'den yardım iste.
     try:
         return extract_turn(message, state)
     except Exception:
-        norm = normalize(message)
         local["descriptors"] = [t for t in norm.split() if t not in COMMON_WORDS]
         return local
 
@@ -372,60 +435,147 @@ def token_search_initial(year, brand, model_or_type, descriptors, raw_message):
 
 
 
-def global_model_candidates(model_or_type, raw_message="", limit=80):
+def establish_brand_code_lock(state):
     """
-    Model/tip bilgisini model yılından bağımsız olarak tüm CSV içinde arar.
-    Böylece 'Egea' -> FIAT gibi marka çıkarımları, hedef yıl o araç için uygun
-    olmasa bile yapılabilir. Yazım hatalarında fuzzy arama kullanılır.
+    Marka belirlendiğinde o markaya ait bütün Marka Kodu değerlerini kilitler.
+    Aynı marka birden fazla kod kullanıyorsa tüm kodlar korunur.
+    """
+    brand = state.get("brand")
+    if not brand:
+        return state
+
+    bnorm, score = best_brand_name(brand)
+    if not bnorm or score < 65:
+        return state
+
+    rows = df[df["_brand_norm"] == bnorm].copy()
+    if rows.empty:
+        return state
+
+    state["brand"] = str(rows["Marka Adı"].iloc[0])
+    state["brand_codes"] = rows["Marka Kodu"].astype(str).drop_duplicates().tolist()
+    return state
+
+
+def enforce_brand_code_lock(rows, state):
+    """Adayların kilitli marka kodlarının dışına çıkmasını engeller."""
+    if rows.empty:
+        return rows
+
+    codes = [str(x) for x in (state.get("brand_codes") or [])]
+    if not codes:
+        return rows
+
+    return rows[rows["Marka Kodu"].astype(str).isin(codes)].copy()
+
+
+def detect_brand_locally(norm_text):
+    """Mercedes / Mercedes-Benz gibi günlük marka yazımlarını Gemini kullanmadan bulur."""
+    if not norm_text:
+        return None
+
+    direct = []
+    for bnorm in brands:
+        if bnorm in norm_text:
+            direct.append(bnorm)
+
+    if direct:
+        chosen = max(direct, key=len)
+        return str(df.loc[df["_brand_norm"] == chosen, "Marka Adı"].iloc[0])
+
+    tokens = [
+        t for t in norm_text.split()
+        if t not in COMMON_WORDS and not re.fullmatch(r"(19|20)\d{2}", t)
+    ]
+    if not tokens:
+        return None
+
+    query = " ".join(tokens)
+    match = process.extractOne(query, brands, scorer=fuzz.WRatio)
+    if match and float(match[1]) >= 84:
+        return str(df.loc[df["_brand_norm"] == match[0], "Marka Adı"].iloc[0])
+
+    return None
+
+
+def global_model_candidates(model_or_type, raw_message="", limit=80, allowed_brand_codes=None):
+    """
+    Model/tip aramasını gerçek CSV kayıtlarında yapar.
+    Marka biliniyorsa yalnızca o markaya ait Marka Kodu satırlarında arar.
+    E200 / E 200 / E-200 aynı model araması olarak kabul edilir.
     """
     query = normalize(model_or_type or "")
     if not query:
         raw = normalize(raw_message)
         stop = {"MODEL", "KASKO", "DEGER", "DEGERI", "NEDIR", "ARAC", "ARABA",
                 "BENIM", "BUL", "BAK", "TL"}
-        words = [w for w in raw.split() if w not in stop and not w.isdigit() and len(w) >= 3]
+        words = [w for w in raw.split() if w not in stop and not w.isdigit() and len(w) >= 2]
         query = " ".join(words)
 
     if not query:
         return df.iloc[0:0].copy(), 0.0
 
-    # Önce tam/kelime içerme.
-    exact = df[df["_type_norm"].str.contains(re.escape(query), regex=True, na=False)].copy()
-    if not exact.empty:
-        return exact.head(limit), 100.0
+    source = df
+    codes = [str(x) for x in (allowed_brand_codes or [])]
+    if codes:
+        source = source[source["Marka Kodu"].astype(str).isin(codes)].copy()
+
+    if source.empty:
+        return source, 0.0
+
+    compact_q = compact_normalize(query)
+
+    if len(compact_q) >= 2:
+        hits = source[
+            source["_type_compact"].str.contains(re.escape(compact_q), regex=True, na=False)
+        ].copy()
+        if not hits.empty:
+            return hits.head(limit), 100.0
+
+    hits = source[
+        source["_type_norm"].str.contains(re.escape(query), regex=True, na=False)
+    ].copy()
+    if not hits.empty:
+        return hits.head(limit), 100.0
 
     words = [w for w in query.split() if len(w) >= 2]
     if words:
-        mask = pd.Series(True, index=df.index)
+        mask = pd.Series(True, index=source.index)
         for w in words:
-            mask &= df["_type_norm"].str.contains(rf"\b{re.escape(w)}\b", regex=True, na=False)
-        word_hits = df[mask].copy()
-        if not word_hits.empty:
-            return word_hits.head(limit), 96.0
+            mask &= source["_type_norm"].str.contains(
+                rf"\b{re.escape(w)}\b", regex=True, na=False
+            )
+        hits = source[mask].copy()
+        if not hits.empty:
+            return hits.head(limit), 96.0
 
-    # Fuzzy aramayı benzersiz marka+tip kayıtları üzerinde yap.
-    uniques = df[["_row_key", "Marka Adı", "Tip Adı", "_full_norm"]].drop_duplicates("_row_key")
+    uniques = source[
+        ["_row_key", "Marka Adı", "Tip Adı", "_full_norm", "_full_compact"]
+    ].drop_duplicates("_row_key")
+
+    use_compact = any(c.isdigit() for c in compact_q)
+    fuzzy_query = compact_q if use_compact else query
+    choices = uniques["_full_compact"].tolist() if use_compact else uniques["_full_norm"].tolist()
+
     matches = process.extract(
-        query,
-        uniques["_full_norm"].tolist(),
+        fuzzy_query,
+        choices,
         scorer=fuzz.WRatio,
         limit=min(40, len(uniques))
     )
     if not matches:
-        return df.iloc[0:0].copy(), 0.0
+        return source.iloc[0:0].copy(), 0.0
 
     top_score = float(matches[0][1])
-    # Çok zayıf eşleşmeleri kabul etme.
     if top_score < 62:
-        return df.iloc[0:0].copy(), top_score
+        return source.iloc[0:0].copy(), top_score
 
-    keys = []
-    for _, score, idx in matches:
-        if score >= max(62, top_score - 8):
-            keys.append(uniques.iloc[idx]["_row_key"])
-
-    return df[df["_row_key"].isin(keys)].copy().head(limit), top_score
-
+    keys = [
+        uniques.iloc[idx]["_row_key"]
+        for _, score, idx in matches
+        if score >= max(62, top_score - 8)
+    ]
+    return source[source["_row_key"].isin(keys)].copy().head(limit), top_score
 
 def natural_conversation_reply(facts, goal, options=None, fallback=None):
     """
@@ -465,20 +615,26 @@ Kurallar:
 
 def infer_brand_from_model(state, turn, message):
     """
-    Kullanıcı marka söylemese bile model/tipten markayı gerçek CSV kayıtlarından
-    çıkarmaya çalışır. Örn: 'Egea' -> FIAT.
+    Marka yazılmasa bile model/tipten markayı çıkarır.
+    Marka zaten biliniyorsa yalnızca kilitli Marka Kodu havuzunda arama yapar.
     """
     model_text = turn.get("model_or_type") or state.get("model_or_type")
     if not model_text:
         return state, df.iloc[0:0].copy(), 0.0
 
-    global_rows, score = global_model_candidates(model_text, message)
+    global_rows, score = global_model_candidates(
+        model_text,
+        message,
+        allowed_brand_codes=state.get("brand_codes")
+    )
+
     if global_rows.empty:
         return state, global_rows, score
 
     unique_brands = global_rows["Marka Adı"].drop_duplicates().tolist()
     if len(unique_brands) == 1 and score >= 70:
-        state["brand"] = unique_brands[0]
+        state["brand"] = str(unique_brands[0])
+        state = establish_brand_code_lock(state)
 
     return state, global_rows, score
 
@@ -493,8 +649,275 @@ def candidate_lines(rows, year, max_rows=35):
 
 
 
+
+DIESEL_MARKERS = {
+    "DCI", "TDI", "CDI", "HDI", "BLUEHDI", "CRDI", "D4D", "D-4D",
+    "DDIS", "DIESEL", "DIZEL", "MULTIJET", "MJET", "JTD"
+}
+ELECTRIC_MARKERS = {"ELECTRIC", "ELEKTRIK", "EV", "BEV", "ZE", "ELECTRIQUE"}
+HYBRID_MARKERS = {"HYBRID", "HIBRIT", "PHEV", "HEV", "MHEV"}
+AUTO_MARKERS = {
+    "DSG", "EDC", "DCT", "CVT", "TIPTRONIC", "STEPTRONIC", "PDK",
+    "AUTOMATIC", "OTOMATIK", "OV", "A/T", "AT"
+}
+BODY_MAP = {
+    "SEDAN": ["SEDAN"],
+    "Hatchback": ["HATCHBACK", "HB"],
+    "Station / Variant": ["VARIANT", "STATION", "SW", "TOURER", "ESTATE"],
+    "SUV": ["SUV"],
+    "Coupe": ["COUPE"],
+    "Cabrio": ["CABRIO", "CONVERTIBLE"],
+    "Pickup": ["PICKUP", "PICK UP"],
+    "Van": ["VAN", "PANELVAN", "PANEL VAN"],
+}
+
+
+def infer_fuel_label(type_name):
+    text = normalize(type_name)
+    tokens = set(text.split())
+
+    if any(x in text for x in HYBRID_MARKERS) or any(x in tokens for x in HYBRID_MARKERS):
+        return "Hibrit"
+    if any(x in text for x in ELECTRIC_MARKERS) or any(x in tokens for x in ELECTRIC_MARKERS):
+        return "Elektrikli"
+    if any(x in text for x in DIESEL_MARKERS) or any(x in tokens for x in DIESEL_MARKERS):
+        return "Dizel"
+
+    # Kasko listesindeki tip adlarında benzinli araçların önemli bir kısmında
+    # "benzin" kelimesi yazmadığı için, dizel/hibrit/elektrik olmayan motorlu
+    # seçenekler benzinli olarak sınıflandırılır.
+    return "Benzinli"
+
+
+def infer_transmission_label(type_name):
+    text = normalize(type_name)
+    tokens = set(text.split())
+    if any(x in text for x in AUTO_MARKERS) or any(x in tokens for x in AUTO_MARKERS):
+        return "Otomatik"
+    return "Manuel"
+
+
+def infer_body_label(type_name):
+    text = normalize(type_name)
+    for label, markers in BODY_MAP.items():
+        if any(m in text for m in markers):
+            return label
+    return None
+
+
+def infer_engine_label(type_name):
+    text = normalize(type_name)
+    match = re.search(r"(?<!\d)(0\.[6-9]|[1-6]\.\d)(?!\d)", text)
+    return match.group(1) if match else None
+
+
+def family_rows_from_state(state):
+    keys = state.get("family_keys") or []
+    if not keys:
+        return df.iloc[0:0].copy()
+
+    rows = df[df["_row_key"].isin(keys)].copy()
+
+    locked_brand = state.get("locked_brand")
+    if locked_brand:
+        bnorm, score = best_brand_name(locked_brand)
+        if bnorm and score >= 65:
+            rows = rows[rows["_brand_norm"] == bnorm].copy()
+
+    return rows
+
+
+def establish_family_lock(state):
+    """
+    Model/tip tanındığında önce Marka Kodu kilidi, sonra araç ailesi kilidi uygulanır.
+    """
+    model = state.get("model_or_type")
+    if not model:
+        return state
+
+    rows, score = global_model_candidates(
+        model,
+        model,
+        limit=300,
+        allowed_brand_codes=state.get("brand_codes")
+    )
+
+    if rows.empty or score < 68:
+        return state
+
+    rows = enforce_brand_code_lock(rows, state)
+    if rows.empty:
+        return state
+
+    unique_brands = rows["Marka Adı"].drop_duplicates().tolist()
+    if len(unique_brands) == 1:
+        state["brand"] = str(unique_brands[0])
+        state["locked_brand"] = str(unique_brands[0])
+        state = establish_brand_code_lock(state)
+
+    compact_model = compact_normalize(model)
+    if re.search(r"[A-Z]", compact_model) and re.search(r"\d", compact_model):
+        state["locked_model"] = str(model).upper()
+    else:
+        hint = common_model_hint(rows)
+        if hint:
+            state["model_or_type"] = hint
+            state["locked_model"] = hint
+        elif not state.get("locked_model"):
+            state["locked_model"] = state.get("model_or_type")
+
+    state["family_keys"] = rows["_row_key"].drop_duplicates().tolist()
+    return state
+
+def enforce_family_lock(rows, state):
+    """Hiçbir aşamada adayların kilitli araç ailesinin dışına çıkmasına izin verme."""
+    if rows.empty:
+        return rows
+
+    family_keys = set(state.get("family_keys") or [])
+    if family_keys:
+        locked = rows[rows["_row_key"].isin(family_keys)].copy()
+        if not locked.empty:
+            rows = locked
+        else:
+            return rows.iloc[0:0].copy()
+
+    locked_brand = state.get("locked_brand")
+    if locked_brand:
+        bnorm, score = best_brand_name(locked_brand)
+        if bnorm and score >= 65:
+            rows = rows[rows["_brand_norm"] == bnorm].copy()
+
+    return rows
+
+
+def candidate_package_options(rows, state):
+    """
+    Motor/yakıt/şanzıman ayrımları bittikten sonra tip adlarından güvenli paket
+    seçenekleri çıkarmaya çalışır. Yalnızca gerçek adaylarda geçen kelimeleri döndürür.
+    """
+    model_tokens = set(normalize(state.get("locked_model") or state.get("model_or_type") or "").split())
+    ignore = set()
+    ignore.update(model_tokens)
+    ignore.update(DIESEL_MARKERS)
+    ignore.update(ELECTRIC_MARKERS)
+    ignore.update(HYBRID_MARKERS)
+    ignore.update(AUTO_MARKERS)
+    ignore.update({
+        "SEDAN", "HATCHBACK", "HB", "VARIANT", "STATION", "SW", "SUV",
+        "COUPE", "CABRIO", "CV", "HP", "E5", "E6", "16V", "8V",
+        "ACT", "SCR", "BMT", "BLUE", "TECH", "EDITION"
+    })
+
+    values = []
+    for name in rows["Tip Adı"].tolist():
+        tokens = normalize(name).split()
+        chosen = None
+        for token in tokens:
+            if token in ignore:
+                continue
+            if re.fullmatch(r"\d+", token):
+                continue
+            if re.fullmatch(r"\d\.\d", token):
+                continue
+            if len(token) < 3:
+                continue
+            # Teknik motor kodu/güç ifadelerini mümkün olduğunca atla.
+            if token in {"TSI", "TFSI", "TCE", "MPI", "VVT", "VTEC", "ECOBOOST"}:
+                continue
+            chosen = token
+            break
+        if chosen:
+            values.append(chosen.title())
+
+    unique = []
+    for v in values:
+        if v not in unique:
+            unique.append(v)
+    return unique[:8]
+
+
+def make_safe_question(rows, year, state):
+    """
+    Gemini'ye araç adı/paket uydurtmadan, yalnızca gerçek adaylardan soru üretir.
+    """
+    rows = enforce_brand_code_lock(rows, state)
+    rows = enforce_family_lock(rows, state)
+    if rows.empty:
+        return {
+            "question": "Aracı bu bilgilerle netleştiremedim. Motor, yakıt, şanzıman veya donanım bilgisinden bildiğiniz birini söyler misiniz?",
+            "options": []
+        }
+
+    known = []
+    if year:
+        known.append(f"{year} model")
+    if state.get("brand"):
+        known.append(str(state["brand"]))
+    if state.get("locked_model") or state.get("model_or_type"):
+        known.append(str(state.get("locked_model") or state.get("model_or_type")))
+    prefix = " ".join(known).strip()
+    prefix = f"{prefix} için" if prefix else "Aracınız için"
+
+    # 1) Yakıt
+    fuels = []
+    for x in rows["Tip Adı"].map(infer_fuel_label).tolist():
+        if x not in fuels:
+            fuels.append(x)
+    if 1 < len(fuels) <= 4:
+        return {
+            "question": f"Anladım. {prefix} birkaç seçenek kaldı. Yakıt türü nedir?",
+            "options": fuels
+        }
+
+    # 2) Kasa
+    bodies = []
+    for x in rows["Tip Adı"].map(infer_body_label).tolist():
+        if x and x not in bodies:
+            bodies.append(x)
+    if 1 < len(bodies) <= 5:
+        return {
+            "question": f"{prefix} kasa tipini de netleştirelim. Hangisi aracınıza uyuyor?",
+            "options": bodies
+        }
+
+    # 3) Motor hacmi
+    engines = []
+    for x in rows["Tip Adı"].map(infer_engine_label).tolist():
+        if x and x not in engines:
+            engines.append(x)
+    if 1 < len(engines) <= 6:
+        return {
+            "question": f"{prefix} motor hacmi nedir?",
+            "options": engines
+        }
+
+    # 4) Şanzıman
+    transmissions = []
+    for x in rows["Tip Adı"].map(infer_transmission_label).tolist():
+        if x not in transmissions:
+            transmissions.append(x)
+    if 1 < len(transmissions) <= 3:
+        return {
+            "question": f"{prefix} şanzıman tipi nedir?",
+            "options": transmissions
+        }
+
+    # 5) Donanım / paket
+    packages = candidate_package_options(rows, state)
+    if 1 < len(packages) <= 8:
+        return {
+            "question": f"{prefix} donanım paketini de netleştirelim. Hangisi aracınıza daha yakın?",
+            "options": packages[:5]
+        }
+
+    return {
+        "question": f"{prefix} birden fazla kayıt kaldı. Motor gücü, şanzıman veya donanım paketinden bildiğiniz bir ayrıntıyı yazar mısınız?",
+        "options": []
+    }
+
 def refine_locally(rows, user_message):
-    """Kısa kullanıcı cevaplarıyla adayları Gemini kullanmadan daralt."""
+    """Kısa cevapları yalnızca mevcut/kilitli aday havuzu içinde daralt."""
     if len(rows) <= 1:
         return rows
 
@@ -502,47 +925,77 @@ def refine_locally(rows, user_message):
     if not q:
         return rows
 
-    synonyms = {
-        "OTOMATIK": ["DSG", "EDC", "DCT", "AT", "TIPTRONIC", "CVT", "AUTO", "AUTOMATIC"],
-        "DIZEL": ["TDI", "CDI", "DCI", "HDI", "CRDI", "DIZEL"],
-        "BENZINLI": ["TSI", "TFSI", "TCE", "BENZIN"],
-        "SEDAN": ["SEDAN"],
-        "VARIANT": ["VARIANT", "STATION", "SW"],
-        "STATION": ["VARIANT", "STATION", "SW"],
-    }
+    # Yakıt türü: özellikle "benzinli" için tip adında BENZIN yazması gerekmez.
+    if "BENZIN" in q:
+        hit = rows[rows["Tip Adı"].map(infer_fuel_label) == "Benzinli"].copy()
+        if not hit.empty:
+            return hit
+    if "DIZEL" in q or "DIESEL" in q:
+        hit = rows[rows["Tip Adı"].map(infer_fuel_label) == "Dizel"].copy()
+        if not hit.empty:
+            return hit
+    if "ELEKTRIK" in q or re.search(r"\bEV\b", q):
+        hit = rows[rows["Tip Adı"].map(infer_fuel_label) == "Elektrikli"].copy()
+        if not hit.empty:
+            return hit
+    if "HIBRIT" in q or "HYBRID" in q:
+        hit = rows[rows["Tip Adı"].map(infer_fuel_label) == "Hibrit"].copy()
+        if not hit.empty:
+            return hit
 
-    terms = []
-    for token in q.split():
-        if token in synonyms:
-            terms.extend(synonyms[token])
-        elif len(token) >= 2 and token not in COMMON_WORDS:
-            terms.append(token)
+    # Şanzıman
+    if "OTOMATIK" in q:
+        hit = rows[rows["Tip Adı"].map(infer_transmission_label) == "Otomatik"].copy()
+        if not hit.empty:
+            return hit
+    if "MANUEL" in q:
+        hit = rows[rows["Tip Adı"].map(infer_transmission_label) == "Manuel"].copy()
+        if not hit.empty:
+            return hit
 
-    if not terms:
-        return rows
+    # Kasa
+    for label, markers in BODY_MAP.items():
+        if normalize(label) in q or any(m in q for m in markers):
+            hit = rows[rows["Tip Adı"].map(infer_body_label) == label].copy()
+            if not hit.empty:
+                return hit
 
+    # Motor hacmi
+    engine = re.search(r"(?<!\d)(0\.[6-9]|[1-6]\.\d)(?!\d)", q)
+    if engine:
+        wanted = engine.group(1)
+        hit = rows[rows["Tip Adı"].map(infer_engine_label) == wanted].copy()
+        if not hit.empty:
+            return hit
+
+    # Kullanıcının yazdığı gerçek paket/teknik kelimeleri aday tip adlarında ara.
+    terms = [t for t in q.split() if len(t) >= 2 and t not in COMMON_WORDS]
+    if terms:
+        mask = pd.Series(True, index=rows.index)
+        matched_any = False
+        for term in terms:
+            term_mask = rows["_type_norm"].str.contains(rf"\b{re.escape(term)}\b", regex=True, na=False)
+            if term_mask.any():
+                mask &= term_mask
+                matched_any = True
+        if matched_any:
+            hit = rows[mask].copy()
+            if not hit.empty:
+                return hit
+
+    # Son çare fuzzy; fakat mevcut aday havuzunun dışına asla çıkılmaz.
     scores = []
     for idx, r in rows.iterrows():
-        text = normalize(r["Tip Adı"])
-        score = 0
-        for term in terms:
-            if re.search(rf"\b{re.escape(term)}\b", text):
-                score += 3
-            elif term in text:
-                score += 2
-            else:
-                score += fuzz.partial_ratio(term, text) / 100.0
+        score = fuzz.WRatio(q, normalize(r["Tip Adı"]))
         scores.append((idx, score))
+    best = max((s for _, s in scores), default=0)
+    if best >= 78:
+        keep = [idx for idx, s in scores if s >= best - 4]
+        hit = rows.loc[keep].copy()
+        if not hit.empty:
+            return hit
 
-    if not scores:
-        return rows
-    best = max(s for _, s in scores)
-    if best < 1.5:
-        return rows
-
-    keep = [idx for idx, s in scores if s >= max(1.5, best - 0.8)]
-    narrowed = rows.loc[keep].copy()
-    return narrowed if not narrowed.empty else rows
+    return rows
 
 def refine_with_ai(rows, year, user_message):
     if len(rows) <= 1:
@@ -717,12 +1170,18 @@ def deterministic_missing_question(state):
 
 def process_search(message, incoming_state):
     incoming_state = incoming_state if isinstance(incoming_state, dict) else {}
+
     state = {
         "year": incoming_state.get("year"),
         "brand": incoming_state.get("brand"),
         "model_or_type": incoming_state.get("model_or_type"),
         "candidate_keys": incoming_state.get("candidate_keys") or [],
+        "family_keys": incoming_state.get("family_keys") or [],
+        "locked_brand": incoming_state.get("locked_brand"),
+        "locked_model": incoming_state.get("locked_model"),
+        "brand_codes": incoming_state.get("brand_codes") or [],
     }
+
     if state["year"] not in (None, ""):
         try:
             state["year"] = int(state["year"])
@@ -741,34 +1200,70 @@ def process_search(message, incoming_state):
         )
         return {"status": "need_info", "question": reply["reply"], "options": [], "state": state}
 
-    # Yeni mesajdaki açık bilgileri hafızaya al.
     if turn.get("year"):
         if state.get("year") and int(turn["year"]) != int(state["year"]):
             state["candidate_keys"] = []
         state["year"] = int(turn["year"])
 
     if turn.get("brand"):
-        state["brand"] = turn["brand"]
+        incoming_brand = str(turn["brand"])
+
+        if state.get("brand") and normalize(incoming_brand) != normalize(state["brand"]):
+            state["candidate_keys"] = []
+            state["family_keys"] = []
+            state["locked_brand"] = None
+            state["locked_model"] = None
+            state["model_or_type"] = None
+            state["brand_codes"] = []
+
+        state["brand"] = incoming_brand
+        state = establish_brand_code_lock(state)
 
     if turn.get("model_or_type"):
-        if state.get("model_or_type") and normalize(turn["model_or_type"]) != normalize(state["model_or_type"]):
-            state["candidate_keys"] = []
-        state["model_or_type"] = turn["model_or_type"]
+        incoming_model = str(turn["model_or_type"])
 
-    # Model verilmişse, marka söylenmemiş olsa bile tüm listeden markayı çıkarmaya çalış.
+        if (
+            state.get("model_or_type")
+            and compact_normalize(incoming_model) != compact_normalize(state["model_or_type"])
+        ):
+            state["candidate_keys"] = []
+            state["family_keys"] = []
+            state["locked_model"] = None
+
+        state["model_or_type"] = incoming_model
+
+    # Modelden marka çıkarımı; ardından Marka Kodu ve aile kilitleri.
     state, global_rows, global_score = infer_brand_from_model(state, turn, message)
 
-    # Temel bilgi toplama tamamen deterministiktir; bilinen bilgi tekrar sorulmaz.
+    if state.get("brand") and not state.get("brand_codes"):
+        state = establish_brand_code_lock(state)
+
+    if state.get("model_or_type") and not state.get("family_keys"):
+        state = establish_family_lock(state)
+
     if state.get("year") and not state.get("brand") and not state.get("model_or_type"):
-        return {"status": "need_info", "question": deterministic_missing_question(state), "options": [], "state": state}
+        return {
+            "status": "need_info",
+            "question": deterministic_missing_question(state),
+            "options": [],
+            "state": state
+        }
 
-    # Model/marka biliniyor fakat yıl eksikse yalnızca yılı sor.
     if not state.get("year"):
-        return {"status": "need_info", "question": deterministic_missing_question(state), "options": [], "state": state}
+        return {
+            "status": "need_info",
+            "question": deterministic_missing_question(state),
+            "options": [],
+            "state": state
+        }
 
-    # Yıl ve marka biliniyor fakat model eksikse yalnızca modeli sor.
     if state.get("brand") and not state.get("model_or_type"):
-        return {"status": "need_info", "question": deterministic_missing_question(state), "options": [], "state": state}
+        return {
+            "status": "need_info",
+            "question": deterministic_missing_question(state),
+            "options": [],
+            "state": state
+        }
 
     requested_year = int(state["year"])
     oldest_year = get_oldest_list_year()
@@ -783,66 +1278,112 @@ def process_search(message, incoming_state):
 
     search_year = oldest_year if requested_year < oldest_year else requested_year
 
-    # Model-yıl uyumluluğu burada peşinen reddedilmez.
-    # Önce gerçek CSV adayları aranır. Böylece 2021 Passat gibi geçerli
-    # araçların yanlışlıkla "uyumsuz" sayılması engellenir.
-
-    # Devam eden adayları son kullanıcı cevabıyla daralt.
+    # Katman 1: Marka Kodu Kilidi
+    # Katman 2: Araç Ailesi Kilidi
+    # Katman 3: yıl / yakıt / kasa / motor / şanzıman / paket
     if state["candidate_keys"]:
         candidates = rows_from_keys(state["candidate_keys"], search_year)
-        before_count = len(candidates)
-        candidates = refine_locally(candidates, message)
-        if len(candidates) == before_count and before_count > 8:
-            try:
-                candidates = refine_with_ai(candidates, search_year, message)
-            except Exception:
-                pass
-    else:
-        candidates = token_search_initial(
-            search_year,
-            state.get("brand"),
-            state.get("model_or_type"),
-            turn.get("descriptors", []),
-            message
-        )
+        candidates = enforce_brand_code_lock(candidates, state)
+        candidates = enforce_family_lock(candidates, state)
 
-        # Eğer yıl bazlı arama başarısızsa ama model globalde tanındıysa
-        # global adayların o baz yılda değeri olanlarını kullan.
+        candidates = refine_locally(candidates, message)
+
+        candidates = enforce_brand_code_lock(candidates, state)
+        candidates = enforce_family_lock(candidates, state)
+
+    else:
+        family_rows = family_rows_from_state(state)
+
+        if not family_rows.empty:
+            candidates = family_rows[
+                family_rows[str(search_year)] > 0
+            ].copy().head(300)
+
+        elif state.get("model_or_type"):
+            candidates, _ = global_model_candidates(
+                state["model_or_type"],
+                message,
+                limit=300,
+                allowed_brand_codes=state.get("brand_codes")
+            )
+            candidates = candidates[
+                candidates[str(search_year)] > 0
+            ].copy()
+
+        else:
+            candidates = token_search_initial(
+                search_year,
+                state.get("brand"),
+                state.get("model_or_type"),
+                turn.get("descriptors", []),
+                message
+            )
+
         if candidates.empty and not global_rows.empty:
-            candidates = global_rows[global_rows[str(search_year)] > 0].copy().head(80)
+            candidates = global_rows[
+                global_rows[str(search_year)] > 0
+            ].copy().head(300)
+
+        candidates = enforce_brand_code_lock(candidates, state)
+        candidates = enforce_family_lock(candidates, state)
 
         if len(candidates) > 1 and turn.get("descriptors"):
-            candidates = refine_locally(candidates, " ".join(turn["descriptors"]))
+            candidates = refine_locally(
+                candidates,
+                " ".join(turn["descriptors"])
+            )
+            candidates = enforce_brand_code_lock(candidates, state)
+            candidates = enforce_family_lock(candidates, state)
 
-    candidates = candidates[candidates[str(search_year)] > 0].copy()
+    candidates = candidates[
+        candidates[str(search_year)] > 0
+    ].copy()
+
+    candidates = enforce_brand_code_lock(candidates, state)
+    candidates = enforce_family_lock(candidates, state)
 
     if candidates.empty:
         state["candidate_keys"] = []
+
         known = (
             f"Yıl: {requested_year}; marka: {state.get('brand') or 'bilinmiyor'}; "
             f"model/tip: {state.get('model_or_type') or 'bilinmiyor'}."
         )
+
         reply = natural_conversation_reply(
             known,
             "Bu bilgilerle uygun kayıt bulunamadığını nazikçe söyle. Kullanıcının daha önce verdiği bilgileri tekrar isteme; eksik olabilecek motor, kasa veya donanım bilgisinden birini doğal biçimde iste.",
             fallback="Aracı tam eşleştiremedim. Motor, kasa veya donanım paketini biraz daha ayrıntılı söyler misiniz?"
         )
-        return {"status": "need_info", "question": reply["reply"], "options": [], "state": state}
+
+        return {
+            "status": "need_info",
+            "question": reply["reply"],
+            "options": [],
+            "state": state
+        }
 
     unique_brands = candidates["Marka Adı"].drop_duplicates().tolist()
     if len(unique_brands) == 1:
-        state["brand"] = unique_brands[0]
+        state["brand"] = str(unique_brands[0])
+        state = establish_brand_code_lock(state)
 
     state["candidate_keys"] = candidates["_row_key"].tolist()
 
     if len(candidates) == 1:
         row = candidates.iloc[0]
         state["candidate_keys"] = []
-        result = row_to_result(row, search_year, requested_year=requested_year)
+
+        result = row_to_result(
+            row,
+            search_year,
+            requested_year=requested_year
+        )
         result["state"] = state
         return result
 
-    q = make_question(candidates, search_year)
+    q = make_safe_question(candidates, search_year, state)
+
     return {
         "status": "clarify",
         "question": q["question"],
@@ -850,7 +1391,6 @@ def process_search(message, incoming_state):
         "candidate_count": int(len(candidates)),
         "state": state
     }
-
 
 @app.route("/")
 def index():
@@ -864,7 +1404,8 @@ def status():
         "csv": ACTIVE_CSV,
         "rows": int(len(df)),
         "gemini_configured": bool(os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")),
-        "model": MODEL
+        "model": MODEL,
+        "version": APP_VERSION
     })
 
 
