@@ -97,7 +97,8 @@ textarea{
   flex:1;resize:none;min-height:50px;max-height:112px;border:1px solid var(--line);border-radius:15px;
   outline:none;background:rgba(0,0,0,.16);color:var(--text);padding:14px 14px;font-size:13px;line-height:1.45
 }
-textarea::placeholder{color:#71839a}textarea:focus{border-color:rgba(100,215,255,.48);box-shadow:0 0 0 3px rgba(100,215,255,.05)}
+textarea::placeholder{color:#71839a}
+textarea:disabled{opacity:.62;cursor:not-allowed;background:rgba(255,255,255,.025)}textarea:focus{border-color:rgba(100,215,255,.48);box-shadow:0 0 0 3px rgba(100,215,255,.05)}
 #send{
   min-width:82px;min-height:50px;border:0;border-radius:15px;padding:0 17px;cursor:pointer;
   background:linear-gradient(135deg,var(--accent),var(--accent2));color:#06101d;font-weight:900

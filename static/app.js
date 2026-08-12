@@ -4,6 +4,7 @@ const messages = document.getElementById("messages");
 const typing = document.getElementById("typing");
 
 let vehicleState = {};
+let searchCompleted = false;
 
 function escapeHtml(s) {
   return String(s ?? "").replace(/[&<>"']/g, c => ({
@@ -81,6 +82,11 @@ function renderResult(data) {
 }
 
 async function search(customText = null) {
+  if (searchCompleted && customText === null) {
+    resetSearch();
+    return;
+  }
+
   const text = (customText ?? input.value).trim();
   if (!text) return;
 
@@ -114,6 +120,14 @@ async function search(customText = null) {
         };
       }
       addAssistant(renderResult(data));
+
+      if (data.status === "found") {
+        searchCompleted = true;
+        send.innerHTML = '<span>Yeni Araç</span><b>↻</b>';
+        input.value = "";
+        input.placeholder = "Yeni bir sorgu için “Yeni Araç” butonuna basın";
+        input.disabled = true;
+      }
     }
   } catch (err) {
     addAssistant("Sunucuya ulaşılamadı. Lütfen tekrar deneyin.");
@@ -159,6 +173,31 @@ if (window.visualViewport) {
   window.visualViewport.addEventListener("resize", () => {
     setTimeout(scrollBottom, 80);
   });
+}
+
+
+function resetSearch() {
+  vehicleState = {};
+  searchCompleted = false;
+
+  messages.innerHTML = `
+    <div class="message assistant">
+      <div class="avatar">K</div>
+      <div class="bubble">
+        Merhaba 👋 Aracınızın kasko değerini bulalım.<br>
+        <strong>Model yılı ve marka/modeli</strong> yazarak başlayabilirsiniz.
+        <div class="mini-example">Örn. “2021 model Passat”</div>
+      </div>
+    </div>
+  `;
+
+  send.innerHTML = '<span>Bul</span><b>↗</b>';
+  input.disabled = false;
+  input.placeholder = "Örn. 2021 model Passat";
+  input.value = "";
+  resizeInput();
+  input.focus({preventScroll:true});
+  scrollBottom();
 }
 
 function scrollBottom() {
