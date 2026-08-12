@@ -16,7 +16,7 @@ app = Flask(__name__)
 DATA_DIR = Path(__file__).parent / "data"
 CSV_PATTERN = str(DATA_DIR / "kasko_guncel*.csv")
 MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
-APP_VERSION = "2.5-smart-disambiguation"
+APP_VERSION = "2.6-exact-selection"
 
 df = None
 brands = []
@@ -990,10 +990,45 @@ def make_safe_question(rows, year, state):
         "options": []
     }
 
+
+def exact_candidate_selection(rows, user_message):
+    """
+    Kullanıcı ekranda gösterilen tam araç tiplerinden birini seçerse,
+    genel motor/yakıt filtrelerine girmeden doğrudan o kaydı seçer.
+    Örn: 'FLUENCE BUSINESS 1.5 DCI (85)' seçildiğinde 85 HP filtresinin
+    diğer 85 HP kayıtlarını da tutması engellenir.
+    """
+    if rows.empty:
+        return rows
+
+    q_norm = normalize(user_message)
+    q_compact = compact_normalize(user_message)
+
+    if not q_norm:
+        return rows.iloc[0:0].copy()
+
+    # 1) Tam normalize eşleşme
+    exact = rows[rows["_type_norm"] == q_norm].copy()
+    if not exact.empty:
+        return exact
+
+    # 2) Noktalama/boşluk farklarına tolerans
+    if "_type_compact" in rows.columns:
+        exact_compact = rows[rows["_type_compact"] == q_compact].copy()
+        if not exact_compact.empty:
+            return exact_compact
+
+    return rows.iloc[0:0].copy()
+
 def refine_locally(rows, user_message):
     """Kısa cevapları yalnızca mevcut/kilitli aday havuzu içinde daralt."""
     if len(rows) <= 1:
         return rows
+
+    # Kullanıcı gerçek tip seçeneklerinden birini seçtiyse bu seçim her şeyden önceliklidir.
+    exact = exact_candidate_selection(rows, user_message)
+    if not exact.empty:
+        return exact
 
     q = normalize(user_message)
     if not q:
@@ -1368,7 +1403,11 @@ def process_search(message, incoming_state):
         candidates = enforce_brand_code_lock(candidates, state)
         candidates = enforce_family_lock(candidates, state)
 
-        candidates = refine_locally(candidates, message)
+        exact = exact_candidate_selection(candidates, message)
+        if not exact.empty:
+            candidates = exact
+        else:
+            candidates = refine_locally(candidates, message)
 
         candidates = enforce_brand_code_lock(candidates, state)
         candidates = enforce_family_lock(candidates, state)
